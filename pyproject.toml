@@ -1,0 +1,94 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "taskhive"
+version = "1.0.0"
+description = "A durable task queue that needs nothing but a SQLite file"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Teesha Mehta" }]
+keywords = ["queue", "task-queue", "sqlite", "jobs", "background-tasks", "worker"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+    "Typing :: Typed",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "hypothesis>=6.100",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+taskhive = "taskhive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Teesha1610/taskhive"
+Issues = "https://github.com/Teesha1610/taskhive/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/taskhive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["src/taskhive"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/taskhive"]
+strict = true
+warn_unreachable = true
+disallow_untyped_defs = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle
+    "F",    # pyflakes
+    "I",    # import order
+    "B",    # bugbear
+    "UP",   # pyupgrade
+    "SIM",  # simplify
+    "RUF",  # ruff rules
+    "S",    # bandit security checks
+]
+ignore = [
+    "S101",  # asserts are the point in tests
+    "E501",  # line length is handled by the formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "B011"]
+"examples/*" = ["S311", "E402"]
+# queue.py builds SQL with f-strings, but the only interpolated values are the
+# TASK_COLUMNS constant, generated runs of `?` placeholders, and fixed fragments
+# chosen by a boolean. Every caller-supplied value is bound as a parameter. The
+# rule stays on everywhere else so a genuine injection is still caught.
+"src/taskhive/queue.py" = ["S608"]
