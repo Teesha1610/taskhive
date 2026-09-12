@@ -1,8 +1,30 @@
 # taskhive
 
-A durable task queue that needs nothing but a SQLite file. No Redis, no broker,
-no daemon. Enqueue work from one process, run it in another, survive a crash in
+**A durable task queue on a single SQLite file.** No broker, no daemon, no
+runtime dependencies. Enqueue in one process, run in another, survive a crash in
 either.
+
+![CI](https://github.com/Teesha1610/taskhive/actions/workflows/ci.yml/badge.svg)
+`107 tests` · `92% coverage` · `strict mypy` · `Linux, macOS, Windows` · `Python 3.10+`
+
+**What is interesting here**
+
+- **Atomic claims under concurrency.** One statement inside `BEGIN IMMEDIATE`
+  hands each task to exactly one worker. Proven with eight real threads racing
+  for 200 tasks and asserting zero duplicates.
+- **Crash recovery by lease expiry.** A worker that dies mid-task leaves a lease
+  that runs out; the task returns to the queue. At-least-once delivery, stated
+  explicitly rather than pretended away.
+- **Retries with full jitter**, plus escape hatches for failures that will never
+  succeed and for rate limits that tell you exactly how long to wait.
+- **Four kinds of test**, including Hypothesis properties and a compatibility
+  path for SQLite versions this machine cannot run.
+- **A 9x performance bug found by measurement.** End to end throughput on
+  Windows was 64 tasks a second against 5,350 on Linux. Three hypotheses were
+  wrong before instrumentation found the cause: `threading.Event.wait(0.001)`
+  takes 15.6ms on Windows while `time.sleep(0.001)` takes 1.6ms, and the claim
+  loop was paying it once per task. [The whole story, dead ends
+  included.](#five-bugs-the-tests-and-benchmarks-caught)
 
 ```python
 from taskhive import TaskQueue, TaskRegistry, Worker
@@ -19,7 +41,19 @@ queue.enqueue("send_email", {"to": "ana@example.com", "subject": "Welcome"})
 Worker(queue, registry, concurrency=4).run()
 ```
 
-Zero runtime dependencies. Python 3.10 and up. Fully typed, strict mypy clean.
+```bash
+pip install -e ".[dev]"    # install with test and lint extras
+pytest                     # 107 tests, no services required
+python examples/benchmark.py
+```
+
+**Where to look:** [`src/taskhive/queue.py`](src/taskhive/queue.py) for the
+claim, [`src/taskhive/worker.py`](src/taskhive/worker.py) for the runtime,
+[`tests/test_concurrency.py`](tests/test_concurrency.py) for the threading
+proofs, [`tests/test_properties.py`](tests/test_properties.py) for the
+Hypothesis invariants.
+
+---
 
 ## Why this exists
 
@@ -32,13 +66,6 @@ cluster.
 SQLite is already on the machine, already crash safe, and in WAL mode handles
 concurrent readers with a single writer perfectly well. The interesting question
 is whether the claim can be made safe, and it can, in one statement.
-
-## Install
-
-```bash
-pip install -e .          # from a clone
-pip install -e ".[dev]"   # with the test and lint extras
-```
 
 ## The design decisions worth knowing
 
