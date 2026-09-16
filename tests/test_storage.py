@@ -53,6 +53,24 @@ def test_capability_probe_matches_the_runtime():
 # ------------------------------------------------------------ pragmas
 
 
+def test_opening_an_existing_wal_database_takes_no_lock(tmp_path):
+    """The WAL switch happens once, not on every open.
+
+    Flipping journal_mode takes a brief exclusive lock. Doing it on every
+    connection means every concurrent open contends for that lock, which is how
+    "database is locked" appeared on a line that only configures a pragma.
+    """
+    path = tmp_path / "wal.db"
+    first = connect(path)
+    assert first.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+
+    # A second connection should find WAL already set and leave it alone.
+    second = connect(path)
+    assert second.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    first.close()
+    second.close()
+
+
 def test_connection_enables_the_pragmas_that_matter(tmp_path):
     conn = connect(tmp_path / "tuned.db")
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
@@ -188,3 +206,46 @@ def test_context_manager_closes():
     with TaskQueue(":memory:") as queue:
         queue.enqueue("job")
         assert queue.stats().pending == 1
+
+
+def test_concurrent_opens_do_not_collide_on_schema_creation(tmp_path):
+    """Sixteen threads opening the same new database at once must all succeed.
+
+    Opening a queue runs DDL, which takes an exclusive lock. Several threads or
+    processes constructing a TaskQueue at the same moment contend there before
+    any task exists, and `busy_timeout` alone does not cover it. CI found this
+    on loaded shared runners while developer machines passed every time: the
+    failing test was doing its concurrent work through queues it had opened in
+    parallel, so the error looked like a queue bug rather than a setup one.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from taskhive import TaskQueue
+
+    path = tmp_path / "race.db"
+    errors: list[Exception] = []
+    guard = threading.Lock()
+    ready = threading.Barrier(16)
+
+    def open_and_use(index: int) -> None:
+        queue = None
+        try:
+            ready.wait(timeout=30)
+            queue = TaskQueue(path)
+            queue.enqueue("job", {"i": index})
+        except Exception as exc:
+            with guard:
+                errors.append(exc)
+        finally:
+            if queue is not None:
+                queue.close()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(open_and_use, range(16)))
+
+    assert errors == [], f"concurrent open produced: {errors[:3]}"
+
+    queue = TaskQueue(path)
+    assert queue.stats().pending == 16
+    queue.close()
