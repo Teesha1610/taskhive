@@ -156,3 +156,49 @@ def test_only_one_worker_can_ack_a_reclaimed_task(path):
     queue.ack(second.id, second.lease_token)
     assert queue.get(second.id).state is TaskState.SUCCEEDED
     queue.close()
+
+
+def test_write_pressure_never_surfaces_database_is_locked(path):
+    """Eight threads writing as fast as they can must not raise.
+
+    SQLite's own busy handler does not cover every conflict: in WAL mode a
+    writer whose snapshot has moved on gets SQLITE_BUSY_SNAPSHOT with no wait at
+    all. Under enough pressure that reaches the caller as "database is locked",
+    which is the queue failing at exactly the moment it is busiest.
+
+    This is the test that was missing. CI on a loaded shared runner found the
+    bug first, on one matrix cell out of ten, while a developer laptop passed
+    every time.
+    """
+    errors: list[Exception] = []
+    guard = threading.Lock()
+    start = threading.Barrier(8)
+
+    def hammer(index: int) -> None:
+        queue = None
+        try:
+            queue = TaskQueue(path)
+            start.wait(timeout=15)
+            for i in range(40):
+                queue.enqueue("job", {"worker": index, "i": i})
+                for task in queue.lease(f"w{index}", limit=2):
+                    if i % 3:
+                        queue.ack(task.id, task.lease_token)
+                    else:
+                        queue.nack(task.id, task.lease_token, error="retry me")
+        except Exception as exc:
+            with guard:
+                errors.append(exc)
+        finally:
+            if queue is not None:
+                queue.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(hammer, range(8)))
+
+    assert errors == [], f"write pressure produced {len(errors)} error(s): {errors[:3]}"
+
+    queue = TaskQueue(path)
+    stats = queue.stats()
+    assert stats.total == 320, "every enqueue should have landed exactly once"
+    queue.close()

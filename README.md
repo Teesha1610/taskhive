@@ -5,7 +5,7 @@ runtime dependencies. Enqueue in one process, run in another, survive a crash in
 either.
 
 ![CI](https://github.com/Teesha1610/taskhive/actions/workflows/ci.yml/badge.svg)
-`107 tests` · `92% coverage` · `strict mypy` · `Linux, macOS, Windows` · `Python 3.10+`
+`108 tests` · `92% coverage` · `strict mypy` · `Linux, macOS, Windows` · `Python 3.10+`
 
 **What is interesting here**
 
@@ -43,7 +43,7 @@ Worker(queue, registry, concurrency=4).run()
 
 ```bash
 pip install -e ".[dev]"    # install with test and lint extras
-pytest                     # 107 tests, no services required
+pytest                     # 108 tests, no services required
 python examples/benchmark.py
 ```
 
@@ -209,7 +209,7 @@ taskhive purge --states succeeded --older-than 86400
 ## Tests
 
 ```bash
-pytest                              # 107 tests
+pytest                              # 108 tests
 pytest --cov --cov-report=term      # 92% coverage
 mypy                                # strict, clean
 ruff check .                        # clean
@@ -226,7 +226,7 @@ Four kinds of test, because they catch different things:
 - **Compatibility tests** that force the pre-3.35 SQLite claim path, which
   cannot run on a modern build and would otherwise rot unnoticed.
 
-### Five bugs the tests and benchmarks caught
+### Six bugs the tests, benchmarks and CI caught
 
 Worth recording, because they are the kind that survive code review:
 
@@ -264,8 +264,17 @@ loop, on the machine that actually had the problem, identified it: one 15.6ms
 wait per task, at every level of concurrency. `examples/diagnose.py` is that
 instrumentation, kept in the repository.
 
+6. **Write pressure surfaced `database is locked`.** CI caught this on one
+   matrix cell out of ten, on a loaded shared runner, while a laptop passed
+   every time. `busy_timeout` is not sufficient on its own: in WAL mode a writer
+   whose snapshot has moved on gets `SQLITE_BUSY_SNAPSHOT` immediately, with no
+   wait, and SQLite's built-in busy handler does not retry it. Write
+   transactions now retry with jittered backoff, and a stress test puts eight
+   threads through interleaved enqueue, claim, ack and nack to hold the line.
+
 The broader lesson: a test suite that only exercises small inputs on one
-operating system will not tell you the throughput collapsed. Benchmarks and a
+operating system, on an unloaded machine, will not tell you the throughput
+collapsed or that the database locks under pressure. Benchmarks and a
 cross-platform CI matrix are part of the tests, not decoration. And a
 performance fix that is not measured on the platform that was slow is a guess.
 

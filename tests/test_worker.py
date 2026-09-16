@@ -268,10 +268,12 @@ def test_worker_stats_shape(queue: TaskQueue):
 
 
 def test_heartbeat_uses_one_thread_for_all_tasks(queue: TaskQueue):
-    """The sweeper must keep every in-flight lease alive, not just one.
+    """The sweeper must extend every in-flight lease, not just one.
 
-    Regression guard for the per-task heartbeat thread this replaced, which
-    cost roughly 2,400 tasks/sec on Linux and 67 on Windows.
+    Asserts that `leased_until` actually moved rather than that nothing expired
+    within a window. The window version passed or failed depending on how loaded
+    the machine was, which is no kind of test at all: it failed on a CI runner
+    and never on a laptop.
     """
     registry = TaskRegistry()
     release = threading.Event()
@@ -280,27 +282,34 @@ def test_heartbeat_uses_one_thread_for_all_tasks(queue: TaskQueue):
     @registry.task("slow")
     def slow() -> None:
         running.release()
-        release.wait(timeout=10)
+        release.wait(timeout=30)
 
     for _ in range(3):
         queue.enqueue("slow", max_attempts=2)
 
-    before = threading.active_count()
-    worker = Worker(
-        queue, registry, concurrency=3, lease_seconds=0.4, heartbeat_interval=0.05
-    )
+    before_threads = threading.active_count()
+    # A long lease, so expiry cannot happen regardless of scheduling, and a
+    # short heartbeat so several sweeps run inside the wait.
+    worker = Worker(queue, registry, concurrency=3, lease_seconds=30, heartbeat_interval=0.05)
     thread = worker.run_in_thread(max_tasks=3)
 
     for _ in range(3):
-        assert running.acquire(timeout=5), "handlers did not all start"
+        assert running.acquire(timeout=15), "handlers did not all start"
 
-    time.sleep(0.8)  # comfortably past the lease, so an absent heartbeat shows
-    extra_threads = threading.active_count() - before
-    assert queue.reclaim_expired() == 0, "the sweeper should have kept all 3 leases alive"
-    assert extra_threads <= 3 + 3, "one sweeper plus the pool, not a thread per task"
+    leases_before = {t.id: t.leased_until for t in queue.list_tasks(state=TaskState.RUNNING)}
+    assert len(leases_before) == 3
+
+    time.sleep(0.5)  # several heartbeat intervals, however loaded the machine
+    leases_after = {t.id: t.leased_until for t in queue.list_tasks(state=TaskState.RUNNING)}
+
+    extended = [tid for tid, after in leases_after.items() if after > leases_before[tid]]
+    assert len(extended) == 3, f"the sweeper extended {len(extended)} of 3 leases"
+
+    extra_threads = threading.active_count() - before_threads
+    assert extra_threads <= 6, "one sweeper plus the pool, not a thread per task"
 
     release.set()
-    thread.join(timeout=10)
+    thread.join(timeout=30)
     assert queue.stats().succeeded == 3
 
 
@@ -326,4 +335,4 @@ def test_idle_backoff_resets_once_work_resumes(queue: TaskQueue):
     elapsed = time.monotonic() - started
 
     assert worker.stats.succeeded == 200
-    assert elapsed < 10, f"draining 200 tasks took {elapsed:.1f}s; the poll backoff is not resetting"
+    assert elapsed < 20, f"draining 200 tasks took {elapsed:.1f}s; the poll backoff is not resetting"

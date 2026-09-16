@@ -20,7 +20,9 @@ data is still caught.
 
 from __future__ import annotations
 
+import contextlib
 import json
+import random
 import secrets
 import sqlite3
 import threading
@@ -44,6 +46,19 @@ TASK_COLUMNS = (
 
 DEFAULT_QUEUE = "default"
 DEFAULT_LEASE_SECONDS = 60.0
+
+# How many times a write transaction retries when SQLite reports the database
+# busy. Roughly a second of total backoff, well inside any sane request budget.
+BUSY_RETRIES = 12
+
+# Backoff jitter, not a security primitive.
+_rng = random.Random()  # noqa: S311
+
+
+def _is_busy(exc: sqlite3.OperationalError) -> bool:
+    """True for the lock-contention errors that are worth retrying."""
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 def _in_claim_order(tasks: Iterable[Task]) -> list[Task]:
@@ -94,23 +109,47 @@ class TaskQueue:
 
     @contextmanager
     def _write(self) -> Iterator[sqlite3.Connection]:
-        """BEGIN IMMEDIATE ... COMMIT, with rollback on failure.
+        """BEGIN IMMEDIATE ... COMMIT, with rollback and busy retry.
 
-        IMMEDIATE takes the write lock up front instead of upgrading from a
-        read lock mid-transaction, which is what produces SQLITE_BUSY deadlocks
+        IMMEDIATE takes the write lock up front instead of upgrading from a read
+        lock mid-transaction, which is what produces SQLITE_BUSY deadlocks
         between two writers that both started as readers.
+
+        `busy_timeout` alone is not enough. SQLite's built-in busy handler does
+        not retry every conflict: in WAL mode a writer whose snapshot has moved
+        on gets SQLITE_BUSY_SNAPSHOT immediately, with no wait, and several
+        writers spinning on a hot queue will eventually hit it. Surfacing that
+        to the caller as "database is locked" would make the queue fail exactly
+        when it is busiest, which is the wrong moment to give up.
+
+        So a failed BEGIN is retried with jittered backoff. The jitter matters
+        for the same reason it matters in the retry policy: without it, two
+        writers that collide retry in lockstep and collide again.
         """
         conn = self.connection
         guard: threading.Lock | None = self._pool.lock if self._pool.serialized else None
         if guard:
             guard.acquire()
         try:
-            conn.execute("BEGIN IMMEDIATE")
+            delay = 0.005
+            for attempt in range(BUSY_RETRIES):
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as exc:
+                    if not _is_busy(exc) or attempt == BUSY_RETRIES - 1:
+                        raise
+                    time.sleep(_rng.uniform(0, delay))
+                    delay = min(delay * 2, 0.25)
+
             try:
                 yield conn
                 conn.execute("COMMIT")
             except Exception:
-                conn.execute("ROLLBACK")
+                # A failed COMMIT may already have closed the transaction, in
+                # which case ROLLBACK has nothing to undo.
+                with contextlib.suppress(sqlite3.OperationalError):
+                    conn.execute("ROLLBACK")
                 raise
         finally:
             if guard:
