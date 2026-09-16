@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import random
 import secrets
 import sqlite3
 import threading
@@ -34,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .backoff import DEFAULT_POLICY, RetryPolicy
-from .db import ConnectionPool, supports_returning
+from .db import BUSY_RETRIES, ConnectionPool, retry_on_busy, supports_returning
 from .errors import LeaseExpiredError
 from .models import QueueStats, Task, TaskState, to_epoch, utcnow
 
@@ -46,19 +45,6 @@ TASK_COLUMNS = (
 
 DEFAULT_QUEUE = "default"
 DEFAULT_LEASE_SECONDS = 60.0
-
-# How many times a write transaction retries when SQLite reports the database
-# busy. Roughly a second of total backoff, well inside any sane request budget.
-BUSY_RETRIES = 12
-
-# Backoff jitter, not a security primitive.
-_rng = random.Random()  # noqa: S311
-
-
-def _is_busy(exc: sqlite3.OperationalError) -> bool:
-    """True for the lock-contention errors that are worth retrying."""
-    message = str(exc).lower()
-    return "locked" in message or "busy" in message
 
 
 def _in_claim_order(tasks: Iterable[Task]) -> list[Task]:
@@ -131,20 +117,12 @@ class TaskQueue:
         if guard:
             guard.acquire()
         try:
-            delay = 0.005
-            for attempt in range(BUSY_RETRIES):
-                try:
-                    conn.execute("BEGIN IMMEDIATE")
-                    break
-                except sqlite3.OperationalError as exc:
-                    if not _is_busy(exc) or attempt == BUSY_RETRIES - 1:
-                        raise
-                    time.sleep(_rng.uniform(0, delay))
-                    delay = min(delay * 2, 0.25)
+            retry_on_busy(lambda: conn.execute("BEGIN IMMEDIATE"), BUSY_RETRIES)
 
             try:
                 yield conn
-                conn.execute("COMMIT")
+                # A COMMIT can also come back busy under WAL contention.
+                retry_on_busy(lambda: conn.execute("COMMIT"), BUSY_RETRIES)
             except Exception:
                 # A failed COMMIT may already have closed the transaction, in
                 # which case ROLLBACK has nothing to undo.
@@ -454,13 +432,13 @@ class TaskQueue:
                       SET state='dead', finished_at=?, updated_at=?,
                           last_error='lease expired and no attempts remained',
                           lease_token=NULL, leased_until=NULL
-                    WHERE state='running' AND leased_until < ? AND attempts >= max_attempts""",
+                    WHERE state='running' AND leased_until <= ? AND attempts >= max_attempts""",
                 (epoch, epoch, epoch),
             ).rowcount
 
             rows = conn.execute(
                 """SELECT id, attempts FROM tasks
-                    WHERE state='running' AND leased_until < ?""",
+                    WHERE state='running' AND leased_until <= ?""",
                 (epoch,),
             ).fetchall()
             for row in rows:

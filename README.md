@@ -5,7 +5,7 @@ runtime dependencies. Enqueue in one process, run in another, survive a crash in
 either.
 
 ![CI](https://github.com/Teesha1610/taskhive/actions/workflows/ci.yml/badge.svg)
-`108 tests` · `92% coverage` · `strict mypy` · `Linux, macOS, Windows` · `Python 3.10+`
+`112 tests` · `92% coverage` · `strict mypy` · `Linux, macOS, Windows` · `Python 3.10+`
 
 **What is interesting here**
 
@@ -43,7 +43,7 @@ Worker(queue, registry, concurrency=4).run()
 
 ```bash
 pip install -e ".[dev]"    # install with test and lint extras
-pytest                     # 108 tests, no services required
+pytest                     # 112 tests, no services required
 python examples/benchmark.py
 ```
 
@@ -209,7 +209,7 @@ taskhive purge --states succeeded --older-than 86400
 ## Tests
 
 ```bash
-pytest                              # 108 tests
+pytest                              # 112 tests
 pytest --cov --cov-report=term      # 92% coverage
 mypy                                # strict, clean
 ruff check .                        # clean
@@ -226,7 +226,7 @@ Four kinds of test, because they catch different things:
 - **Compatibility tests** that force the pre-3.35 SQLite claim path, which
   cannot run on a modern build and would otherwise rot unnoticed.
 
-### Six bugs the tests, benchmarks and CI caught
+### Seven bugs the tests, benchmarks and CI caught
 
 Worth recording, because they are the kind that survive code review:
 
@@ -264,13 +264,27 @@ loop, on the machine that actually had the problem, identified it: one 15.6ms
 wait per task, at every level of concurrency. `examples/diagnose.py` is that
 instrumentation, kept in the repository.
 
-6. **Write pressure surfaced `database is locked`.** CI caught this on one
-   matrix cell out of ten, on a loaded shared runner, while a laptop passed
-   every time. `busy_timeout` is not sufficient on its own: in WAL mode a writer
-   whose snapshot has moved on gets `SQLITE_BUSY_SNAPSHOT` immediately, with no
-   wait, and SQLite's built-in busy handler does not retry it. Write
-   transactions now retry with jittered backoff, and a stress test puts eight
-   threads through interleaved enqueue, claim, ack and nack to hold the line.
+6. **`database is locked` under concurrent opens.** CI found this on loaded
+   shared runners, on a shifting subset of the matrix, while laptops passed
+   every time. The first fix was wrong: retrying `BEGIN IMMEDIATE` changed
+   nothing, and the coverage report said why, showing the new retry branch had
+   never executed. The contention was not in any queue operation. It was in
+   schema creation, which runs DDL under an exclusive lock, and the failing test
+   opened sixteen queues in parallel before doing anything else. `busy_timeout`
+   does not cover that. Two layers of it, in fact: schema creation runs DDL, and
+   before that, switching a new file into WAL takes a brief exclusive lock of
+   its own, so the error surfaced from a line that only sets a pragma. WAL is
+   now read before it is set, so the lock is taken once in a file's lifetime
+   rather than on every open, and opening, migrating, committing and claiming
+   share one jittered retry helper. Each has a regression test.
+
+7. **A lease expiring exactly now was not treated as expired.** Reclaim asked
+   for `leased_until < now`, so whether a zero-length lease was recovered
+   depended on the clock ticking between two calls. It does on Linux. On
+   Windows `time.time()` can return the same value twice in a row, so a crashed
+   worker's task stayed stuck. `<=` is both correct and independent of clock
+   resolution. That is three separate defects traced to Windows timer
+   granularity: a 15.6ms `Event.wait`, contention during WAL setup, and this.
 
 The broader lesson: a test suite that only exercises small inputs on one
 operating system, on an unloaded machine, will not tell you the throughput

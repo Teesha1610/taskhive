@@ -326,3 +326,38 @@ def test_persistence_survives_reopening(tmp_path):
     assert found.payload == {"n": 1}
     assert found.state is TaskState.PENDING
     second.close()
+
+
+def test_a_lease_expiring_exactly_now_is_reclaimed(queue: TaskQueue):
+    """The boundary case, pinned so a coarse clock cannot hide it.
+
+    A zero-length lease sets `leased_until` to the instant it was taken. With a
+    strict `<` comparison, reclaiming it depends on the clock advancing between
+    two calls, which it does on Linux and does not reliably do on Windows, where
+    `time.time()` can return the same value twice in a row. The result was a
+    crashed worker's task staying stuck, on one platform only.
+    """
+    from taskhive.models import to_epoch, utcnow
+
+    task = queue.enqueue("job", max_attempts=3)
+    leased = queue.lease("worker-1", lease_seconds=0.0)[0]
+
+    stored = queue.get(leased.id)
+    assert stored.leased_until is not None
+    # The deadline is at or before now, whatever the clock's resolution.
+    assert to_epoch(stored.leased_until) <= to_epoch(utcnow())
+
+    assert queue.reclaim_expired() == 1
+    assert queue.get(task.id).state is TaskState.PENDING
+
+
+def test_reclaim_uses_the_supplied_clock(queue: TaskQueue):
+    """Reclaim must honour an explicit `now`, so tests need no sleeping."""
+    from datetime import timedelta
+
+    queue.enqueue("job", max_attempts=3)
+    leased = queue.lease("worker-1", lease_seconds=300)[0]
+
+    assert queue.reclaim_expired() == 0
+    assert queue.reclaim_expired(now=utcnow() + timedelta(seconds=301)) == 1
+    assert queue.get(leased.id).state is TaskState.PENDING
